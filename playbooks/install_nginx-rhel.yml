@@ -5,9 +5,7 @@
   gather_facts: false
   vars:
     website_url: "https://github.com/ansible-tmm/parasol-website"
-    website_repo: "https://github.com/ansible-tmm/parasol-website.git"
     nginx_root: "/usr/share/nginx/html"
-    temp_dir: "/tmp/parasol-website"
 
   pre_tasks:
     - name: Wait for SSH to be available
@@ -15,72 +13,48 @@
         timeout: 300
         delay: 5
 
-  tasks:
-    - name: Install git (required to clone the repository)
-      ansible.builtin.dnf:
-        name: git
-        state: present
+    - name: Add swap if none exists
+      ansible.builtin.shell: |
+        if ! swapon --show | grep -q .; then
+          fallocate -l 1G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+        fi
+      changed_when: false
 
-    - name: Ensure Nginx is installed (RHEL)
+  tasks:
+    - name: Install Nginx
       ansible.builtin.dnf:
         name: nginx
         state: present
 
-    - name: Remove existing nginx html directory contents
-      ansible.builtin.file:
-        path: "{{ nginx_root }}/"
-        state: absent
-
-    - name: Ensure nginx html directory exists
+    - name: Clear and recreate nginx web root
       ansible.builtin.file:
         path: "{{ nginx_root }}"
-        state: directory
+        state: "{{ item }}"
         mode: '0755'
         owner: root
         group: root
+      loop:
+        - absent
+        - directory
 
-    - name: Clone Parasol website repository
-      ansible.builtin.git:
-        repo: "{{ website_repo }}"
-        dest: "{{ temp_dir }}"
-        version: main
-        force: true
-
-    - name: Copy website files to nginx root
-      ansible.builtin.copy:
-        src: "{{ temp_dir }}/"
-        dest: "{{ nginx_root }}/"
+    - name: Download and extract website
+      ansible.builtin.unarchive:
+        src: "{{ website_url }}/archive/refs/heads/main.tar.gz"
+        dest: "{{ nginx_root }}"
         remote_src: true
+        extra_opts: ['--strip-components=1']
         owner: root
         group: root
-        mode: '0644'
-        directory_mode: '0755'
 
-    - name: Restore SELinux contexts on NGINX html directory
-      ansible.builtin.command: restorecon -Rv /usr/share/nginx/html
+    - name: Restore SELinux contexts on web root
+      ansible.builtin.command: restorecon -Rv {{ nginx_root }}
       changed_when: false
 
-    - name: Ensure correct permissions on NGINX web root
-      ansible.builtin.file:
-        path: /usr/share/nginx/html
-        owner: root
-        group: root
-        mode: '0755'
-        recurse: true
-
-    - name: Clean up temporary directory
-      ansible.builtin.file:
-        path: "{{ temp_dir }}"
-        state: absent
-
-    - name: Restart nginx service
+    - name: Enable and start Nginx
       ansible.builtin.systemd:
         name: nginx
         state: restarted
-        enabled: true
-
-    - name: Ensure nginx is running
-      ansible.builtin.systemd:
-        name: nginx
-        state: started
         enabled: true
