@@ -29,7 +29,7 @@
 
   - name: Add provisioned EC2 instances to in-memory inventory
     ansible.builtin.add_host:
-      name: "{{ aws_name_tag | default('ec2') }}-{{ ansible_loop.index }}"
+      name: "{{ aws_name_tag | default('ec2') }}-{{ idx + 1 }}"
       ansible_host: "{{ item }}"
       ansible_user: "{{ input_ec2_ssh_user | default(ansible_user | default('ec2-user')) }}"
       groups: provisioned_ec2
