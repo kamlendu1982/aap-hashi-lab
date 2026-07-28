@@ -8,12 +8,6 @@ terraform {
 	}
 }
 
-variable "ansible_user" {
-  type        = string
-  description = "SSH user Ansible uses to connect to provisioned EC2 instances."
-  default     = "ec2-user"
-}
-
 variable "region_name" {
   type        = string
   description = "The AWS region to provision resources into."

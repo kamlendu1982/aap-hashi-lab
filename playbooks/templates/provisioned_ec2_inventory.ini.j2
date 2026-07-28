@@ -1,0 +1,8 @@
+# Dynamic inventory generated after Terraform apply
+[provisioned_ec2]
+{% for ip in instance_ips %}
+{{ aws_name_tag }}-{{ loop.index }} ansible_host={{ ip }} ansible_user={{ ec2_ssh_user }} ansible_ssh_private_key_file={{ ec2_ssh_private_key_file }} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+{% endfor %}
+
+[provisioned_ec2:vars]
+ansible_python_interpreter=/usr/bin/python3
