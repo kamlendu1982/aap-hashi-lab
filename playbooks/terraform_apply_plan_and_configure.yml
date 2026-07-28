@@ -37,7 +37,8 @@
     loop_control:
       index_var: idx
 
-- import_playbook:
-    file: install_nginx-rhel.yml
-    vars:
+  - name: Set nginx target host group for chained playbook
+    ansible.builtin.set_fact:
       nginx_target_hosts: provisioned_ec2
+
+- import_playbook: install_nginx-rhel.yml
