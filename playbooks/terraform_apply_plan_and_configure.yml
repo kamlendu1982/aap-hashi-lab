@@ -1,118 +1,58 @@
 ---
-- name: Provision AWS resources with Terraform and configure Nginx
-  hosts: localhost
+- import_playbook: terraform_apply_plan.yml
+
+- name: Configure provisioned EC2 instances with Nginx
+  hosts: all
   gather_facts: false
   vars:
-    working_dir_name: "{{ input_tf_working_dir_name | default('provision_tf_resources') }}"
-    tf_plan_file_name: "{{ input_tf_plan_file_name | default('provision_tf_resources.tf') }}"
-    tf_vars_file_name: "{{ input_tf_vars_file_name | default('provision_tf_resources.auto.tfvars') }}"
-    cloud_provider: "{{ input_cloud_provider | default('AWS') }}"
-    aws_ami_id: "ami-035032ea878eca201"  # RHEL 9.7 public AMI
-
-    # SSH settings for the post-provision playbook
     ec2_ssh_user: "{{ input_ec2_ssh_user | default('ec2-user') }}"
     ec2_ssh_private_key_file: "{{ input_ec2_ssh_private_key_file }}"
     dynamic_inventory_path: "{{ input_dynamic_inventory_path | default('/tmp/provisioned_ec2_inventory.ini') }}"
-    tf_output_name: "{{ input_tf_output_name | default('instance_ip_addr') }}"
-
   tasks:
-    - name: Validate required SSH private key path is provided
-      ansible.builtin.assert:
-        that:
-          - ec2_ssh_private_key_file is defined
-          - ec2_ssh_private_key_file | length > 0
-        fail_msg: >
-          Set extra var input_ec2_ssh_private_key_file to the private key file
-          that matches aws_instance_public_key.
 
-    - name: Make sure working directory exists
-      ansible.builtin.file:
-        path: /var/terraform/plans/{{ working_dir_name }}
-        state: directory
-        mode: '0755'
+  - name: Validate SSH private key path is provided for EC2 configuration
+    ansible.builtin.assert:
+      that:
+        - ec2_ssh_private_key_file is defined
+        - ec2_ssh_private_key_file | length > 0
+      fail_msg: >
+        Set extra var input_ec2_ssh_private_key_file to the private key file
+        that matches aws_instance_public_key.
 
-    - name: Copy the TF Plan
-      ansible.builtin.template:
-        src: "../TF_templates/{{ cloud_provider }}/{{ tf_plan_file_name }}.j2"
-        dest: /var/terraform/plans/{{ working_dir_name }}/{{ tf_plan_file_name }}
+  - name: Retrieve instance IPs from Terraform outputs
+    hashicorp.terraform.output:
+      tf_hostname: "{{ tf_hostname }}"
+      tf_validate_certs: false
+      tf_token: "{{ tf_token }}"
+      organization: "{{ tf_org }}"
+      workspace: "{{ tf_workspace }}"
+      name: instance_ip_addr
+    register: tf_instance_ips
 
-    - name: Copy the TF Vars Template
-      ansible.builtin.template:
-        src: "../TF_templates/{{ cloud_provider }}/{{ tf_vars_file_name }}.j2"
-        dest: /var/terraform/plans/{{ working_dir_name }}/{{ tf_vars_file_name }}
+  - name: Set instance IP list from Terraform output
+    ansible.builtin.set_fact:
+      instance_ips: "{{ tf_instance_ips.output.value }}"
 
-    - name: Create a new config version
-      hashicorp.terraform.configuration_version:
-        auto_queue_runs: false
-        tf_hostname: "{{ tf_hostname }}"
-        tf_validate_certs: false
-        tf_token: "{{ tf_token }}"
-        organization: "{{ tf_org }}"
-        workspace: "{{ tf_workspace }}"
-        state: present
-        configuration_files_path: /var/terraform/plans/{{ working_dir_name }}
+  - name: Ensure at least one instance IP was returned
+    ansible.builtin.assert:
+      that:
+        - instance_ips | length > 0
+        - instance_ips[0] | length > 0
+      fail_msg: "Terraform apply completed but no instance IPs were found in output 'instance_ip_addr'."
 
-    - name: Create a new TF run and apply the changes
-      hashicorp.terraform.run:
-        tf_hostname: "{{ tf_hostname }}"
-        tf_validate_certs: false
-        tf_token: "{{ tf_token }}"
-        organization: "{{ tf_org }}"
-        workspace: "{{ tf_workspace }}"
-        run_message: "New run to provision resources from Ansible"
-        auto_apply: true
-        poll_interval: 5
-        poll_timeout: 360
-        state: present
-      register: tf_run
+  - name: Generate dynamic inventory for provisioned EC2 hosts
+    ansible.builtin.template:
+      src: templates/provisioned_ec2_inventory.ini.j2
+      dest: "{{ dynamic_inventory_path }}"
+      mode: '0600'
 
-    - name: Retrieve instance IPs from Terraform outputs
-      hashicorp.terraform.output:
-        tf_hostname: "{{ tf_hostname }}"
-        tf_validate_certs: false
-        tf_token: "{{ tf_token }}"
-        organization: "{{ tf_org }}"
-        workspace: "{{ tf_workspace }}"
-        name: "{{ tf_output_name }}"
-      register: tf_instance_ips
-
-    - name: Normalize Terraform output to a list of IPs
-      ansible.builtin.set_fact:
-        instance_ips: "{{ tf_instance_ips.output.value if (tf_instance_ips.output.value is iterable and tf_instance_ips.output.value is not string) else [tf_instance_ips.output.value] }}"
-
-    - name: Ensure at least one instance IP was returned
-      ansible.builtin.assert:
-        that:
-          - instance_ips | length > 0
-          - instance_ips[0] | length > 0
-        fail_msg: "Terraform apply completed but no instance IPs were found in output '{{ tf_output_name }}'."
-
-    - name: Wait for SSH on each new EC2 instance
-      ansible.builtin.wait_for:
-        host: "{{ item }}"
-        port: 22
-        delay: 10
-        timeout: 300
-      loop: "{{ instance_ips }}"
-
-    - name: Generate dynamic inventory for provisioned EC2 hosts
-      ansible.builtin.template:
-        src: templates/provisioned_ec2_inventory.ini.j2
-        dest: "{{ dynamic_inventory_path }}"
-        mode: '0600'
-
-    - name: Display generated inventory
-      ansible.builtin.command:
-        cmd: cat {{ dynamic_inventory_path }}
-      changed_when: false
-
-    - name: Run Nginx configuration playbook on provisioned EC2 instances
-      ansible.builtin.command:
-        cmd: >
-          ansible-playbook
-          -i {{ dynamic_inventory_path }}
-          --limit provisioned_ec2
-          {{ playbook_dir }}/install_nginx-rhel.yml
-      environment:
-        ANSIBLE_HOST_KEY_CHECKING: "False"
-      changed_when: true
+  - name: Run Nginx configuration playbook on provisioned EC2 instances
+    ansible.builtin.command:
+      argv:
+        - ansible-playbook
+        - "-i"
+        - "{{ dynamic_inventory_path }}"
+        - "{{ playbook_dir }}/install_nginx-rhel.yml"
+    environment:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    changed_when: true
