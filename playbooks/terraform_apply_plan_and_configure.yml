@@ -1,23 +1,10 @@
 ---
 - import_playbook: terraform_apply_plan.yml
 
-- name: Configure provisioned EC2 instances with Nginx
+- name: Register provisioned EC2 instances for configuration
   hosts: all
   gather_facts: false
-  vars:
-    ec2_ssh_user: "{{ input_ec2_ssh_user | default('ec2-user') }}"
-    ec2_ssh_private_key_file: "{{ input_ec2_ssh_private_key_file }}"
-    dynamic_inventory_path: "{{ input_dynamic_inventory_path | default('/tmp/provisioned_ec2_inventory.ini') }}"
   tasks:
-
-  - name: Validate SSH private key path is provided for EC2 configuration
-    ansible.builtin.assert:
-      that:
-        - ec2_ssh_private_key_file is defined
-        - ec2_ssh_private_key_file | length > 0
-      fail_msg: >
-        Set extra var input_ec2_ssh_private_key_file to the private key file
-        that matches aws_instance_public_key.
 
   - name: Retrieve instance IPs from Terraform outputs
     hashicorp.terraform.output:
@@ -40,19 +27,17 @@
         - instance_ips[0] | length > 0
       fail_msg: "Terraform apply completed but no instance IPs were found in output 'instance_ip_addr'."
 
-  - name: Generate dynamic inventory for provisioned EC2 hosts
-    ansible.builtin.template:
-      src: templates/provisioned_ec2_inventory.ini.j2
-      dest: "{{ dynamic_inventory_path }}"
-      mode: '0600'
+  - name: Add provisioned EC2 instances to in-memory inventory
+    ansible.builtin.add_host:
+      name: "{{ aws_name_tag | default('ec2') }}-{{ ansible_loop.index }}"
+      ansible_host: "{{ item }}"
+      ansible_user: "{{ input_ec2_ssh_user | default(ansible_user | default('ec2-user')) }}"
+      groups: provisioned_ec2
+    loop: "{{ instance_ips }}"
+    loop_control:
+      index_var: idx
 
-  - name: Run Nginx configuration playbook on provisioned EC2 instances
-    ansible.builtin.command:
-      argv:
-        - ansible-playbook
-        - "-i"
-        - "{{ dynamic_inventory_path }}"
-        - "{{ playbook_dir }}/install_nginx-rhel.yml"
-    environment:
-      ANSIBLE_HOST_KEY_CHECKING: "False"
-    changed_when: true
+- import_playbook:
+    file: install_nginx-rhel.yml
+    vars:
+      nginx_target_hosts: provisioned_ec2

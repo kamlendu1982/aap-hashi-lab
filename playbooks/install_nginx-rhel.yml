@@ -1,6 +1,6 @@
 ---
 - name: Deploy Parasol Insurance Website to RHEL 9 with Nginx
-  hosts: all
+  hosts: "{{ nginx_target_hosts | default('all') }}"
   become: true
   gather_facts: false
   vars:
