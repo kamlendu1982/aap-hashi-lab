@@ -1,60 +1,12 @@
 ---
 - name: Deploy Parasol Insurance Website to RHEL 9 with Nginx
-  hosts: "{{ nginx_target_hosts | default('all') }}"
+  hosts: all
   become: true
   gather_facts: false
   vars:
     website_url: "https://github.com/ansible-tmm/parasol-website"
     nginx_root: "/usr/share/nginx/html"
 
-  pre_tasks:
-    - name: Wait for SSH to be available
-      ansible.builtin.wait_for_connection:
-        timeout: 300
-        delay: 5
-
-    - name: Add swap if none exists
-      ansible.builtin.shell: |
-        if ! swapon --show | grep -q .; then
-          fallocate -l 1G /swapfile
-          chmod 600 /swapfile
-          mkswap /swapfile
-          swapon /swapfile
-        fi
-      changed_when: false
-
   tasks:
-    - name: Install Nginx
-      ansible.builtin.dnf:
-        name: nginx
-        state: present
-
-    - name: Clear and recreate nginx web root
-      ansible.builtin.file:
-        path: "{{ nginx_root }}"
-        state: "{{ item }}"
-        mode: '0755'
-        owner: root
-        group: root
-      loop:
-        - absent
-        - directory
-
-    - name: Download and extract website
-      ansible.builtin.unarchive:
-        src: "{{ website_url }}/archive/refs/heads/main.tar.gz"
-        dest: "{{ nginx_root }}"
-        remote_src: true
-        extra_opts: ['--strip-components=1']
-        owner: root
-        group: root
-
-    - name: Restore SELinux contexts on web root
-      ansible.builtin.command: restorecon -Rv {{ nginx_root }}
-      changed_when: false
-
-    - name: Enable and start Nginx
-      ansible.builtin.systemd:
-        name: nginx
-        state: restarted
-        enabled: true
+    - name: Run Nginx installation tasks
+      ansible.builtin.import_tasks: tasks/install_nginx-rhel.yml
