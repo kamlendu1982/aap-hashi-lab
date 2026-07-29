@@ -1,3 +1,1 @@
-ansible_private_key = <<EOF
-{{ ansible_private_key }}
-EOF
+ansible_private_key = {{ ansible_private_key | tojson }}

@@ -12,21 +12,33 @@
 
   tasks:
 
-  - name: Resolve SSH private key file path from credential or extra vars
-    ansible.builtin.set_fact:
-      ec2_private_key_path: >-
-        {{
-          ansible_ssh_private_key_file | default('', true)
-          if (ansible_ssh_private_key_file | default('', true) | length > 0)
-          else input_ec2_ssh_private_key_file | default(aws_instance_private_key_file | default('', true), true)
-        }}
-
-  - name: Use SSH private key content supplied directly in extra vars
+  - name: Use SSH private key content supplied in extra vars
     ansible.builtin.set_fact:
       ansible_private_key: "{{ input_ansible_private_key | default(aws_instance_private_key) }}"
     when:
       - (input_ansible_private_key | default(aws_instance_private_key | default(''))) | length > 0
     no_log: true
+
+  - name: Resolve SSH private key file path from extra vars
+    ansible.builtin.set_fact:
+      ec2_private_key_path: >-
+        {{
+          [
+            input_ec2_ssh_private_key_file | default(''),
+            aws_instance_private_key_file | default(''),
+            ansible_ssh_private_key_file | default(''),
+            lookup('vars', 'ansible_ssh_private_key_file', default='')
+          ] | map('trim') | reject('equalto', '') | first | default('')
+        }}
+    when: ansible_private_key is not defined
+
+  - name: Check SSH private key file exists before reading
+    ansible.builtin.stat:
+      path: "{{ ec2_private_key_path }}"
+    register: ec2_private_key_stat
+    when:
+      - ansible_private_key is not defined
+      - ec2_private_key_path | length > 0
 
   - name: Read SSH private key from file for Terraform ansible provider
     ansible.builtin.slurp:
@@ -35,6 +47,7 @@
     when:
       - ansible_private_key is not defined
       - ec2_private_key_path | length > 0
+      - ec2_private_key_stat.stat.exists | default(false)
     no_log: true
 
   - name: Set Terraform ansible private key fact from file
@@ -52,10 +65,27 @@
         - ansible_private_key is defined
         - ansible_private_key | length > 0
       fail_msg: >
-        Provide the SSH private key matching aws_instance_public_key using one of:
-        - Machine Credential attached to this job template, or
-        - Extra var input_ansible_private_key / aws_instance_private_key (key content), or
-        - Extra var input_ec2_ssh_private_key_file / aws_instance_private_key_file (path to key file).
+        The Terraform ansible provider needs the SSH private key CONTENT in this
+        playbook. A standard AAP Machine Credential does NOT expose the private
+        key to playbook variables (only username is available as ansible_user).
+
+        Fix using ONE of these options:
+
+        1) Job Template extra var (recommended) - add encrypted survey/extra var:
+           aws_instance_private_key: |
+             -----BEGIN OPENSSH PRIVATE KEY-----
+             ...
+             -----END OPENSSH PRIVATE KEY-----
+
+        2) Credential Input Source on the Job Template:
+           - Source credential: your Machine Credential
+           - Input field: SSH Private Key
+           - Target extra variable: aws_instance_private_key
+
+        3) Extra var with a readable key file path inside the EE:
+           aws_instance_private_key_file: /path/to/key.pem
+
+        The private key must match aws_instance_public_key used by Terraform.
 
   - name: Make sure working directory exists
     ansible.builtin.file:
@@ -69,17 +99,23 @@
       state: directory
       mode: '0755'
 
-  - name: Copy Ansible playbook into Terraform working directory
-    ansible.builtin.copy:
-      src: "{{ playbook_dir }}/install_nginx-rhel.yml"
-      dest: /var/terraform/plans/{{ working_dir_name }}/install_nginx-rhel.yml
-      mode: '0644'
-
   - name: Copy Terraform inventory template into working directory
     ansible.builtin.copy:
       src: "../TF_templates/{{ cloud_provider }}/templates/provisioned_ec2_inventory.ini.tftpl"
       dest: /var/terraform/plans/{{ working_dir_name }}/templates/provisioned_ec2_inventory.ini.tftpl
       mode: '0644'
+
+  - name: Write SSH private key file for post-Terraform Ansible configuration
+    ansible.builtin.copy:
+      content: "{{ ansible_private_key }}"
+      dest: "/tmp/{{ aws_name_tag | default('ec2') }}_aap_private_key.pem"
+      mode: '0600'
+    no_log: true
+
+  - name: Set SSH private key path for post-Terraform Ansible configuration
+    ansible.builtin.set_fact:
+      ec2_ssh_private_key_file: "/tmp/{{ aws_name_tag | default('ec2') }}_aap_private_key.pem"
+      ec2_ssh_user: "{{ input_ec2_ssh_user | default(ansible_user | default('ec2-user')) }}"
 
   - name: Copy the Terraform ansible provider vars template
     ansible.builtin.template:
@@ -89,3 +125,92 @@
     no_log: true
 
 - import_playbook: terraform_apply_plan.yml
+
+- name: Register provisioned EC2 instances after Terraform apply
+  hosts: all
+  gather_facts: false
+  tasks:
+
+  - name: Retrieve instance IPs from Terraform outputs
+    hashicorp.terraform.output:
+      tf_hostname: "{{ tf_hostname }}"
+      tf_validate_certs: false
+      tf_token: "{{ tf_token }}"
+      organization: "{{ tf_org }}"
+      workspace: "{{ tf_workspace }}"
+      name: instance_ip_addr
+    register: tf_instance_ips
+
+  - name: Set instance IP list from Terraform output
+    ansible.builtin.set_fact:
+      instance_ips: "{{ tf_instance_ips.output.value }}"
+
+  - name: Add provisioned EC2 instances to in-memory inventory
+    ansible.builtin.add_host:
+      name: "{{ aws_name_tag | default('ec2') }}-{{ idx + 1 }}"
+      ansible_host: "{{ item }}"
+      ansible_user: "{{ ec2_ssh_user }}"
+      ansible_ssh_private_key_file: "{{ ec2_ssh_private_key_file }}"
+      groups: provisioned_ec2
+    loop: "{{ instance_ips }}"
+    loop_control:
+      index_var: idx
+
+- name: Deploy Parasol Insurance Website to provisioned EC2 instances
+  hosts: provisioned_ec2
+  become: true
+  gather_facts: false
+  vars:
+    website_url: "https://github.com/ansible-tmm/parasol-website"
+    nginx_root: "/usr/share/nginx/html"
+
+  tasks:
+    - name: Wait for SSH to be available
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        delay: 5
+
+    - name: Add swap if none exists
+      ansible.builtin.shell: |
+        if ! swapon --show | grep -q .; then
+          fallocate -l 1G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+        fi
+      changed_when: false
+
+    - name: Install Nginx
+      ansible.builtin.dnf:
+        name: nginx
+        state: present
+
+    - name: Clear and recreate nginx web root
+      ansible.builtin.file:
+        path: "{{ nginx_root }}"
+        state: "{{ item }}"
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - absent
+        - directory
+
+    - name: Download and extract website
+      ansible.builtin.unarchive:
+        src: "{{ website_url }}/archive/refs/heads/main.tar.gz"
+        dest: "{{ nginx_root }}"
+        remote_src: true
+        extra_opts: ['--strip-components=1']
+        owner: root
+        group: root
+
+    - name: Restore SELinux contexts on web root
+      ansible.builtin.command: restorecon -Rv {{ nginx_root }}
+      changed_when: false
+
+    - name: Enable and start Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: true
