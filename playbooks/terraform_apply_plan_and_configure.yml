@@ -1,98 +1,65 @@
 ---
-- import_playbook: terraform_apply_plan.yml
-
-- name: Register provisioned EC2 instances for configuration
+- name: Prepare Terraform bundle for AWS provisioning and Ansible configuration
   hosts: all
   gather_facts: false
-  tasks:
-
-  - name: Retrieve instance IPs from Terraform outputs
-    hashicorp.terraform.output:
-      tf_hostname: "{{ tf_hostname }}"
-      tf_validate_certs: false
-      tf_token: "{{ tf_token }}"
-      organization: "{{ tf_org }}"
-      workspace: "{{ tf_workspace }}"
-      name: instance_ip_addr
-    register: tf_instance_ips
-
-  - name: Set instance IP list from Terraform output
-    ansible.builtin.set_fact:
-      instance_ips: "{{ tf_instance_ips.output.value }}"
-
-  - name: Ensure at least one instance IP was returned
-    ansible.builtin.assert:
-      that:
-        - instance_ips | length > 0
-        - instance_ips[0] | length > 0
-      fail_msg: "Terraform apply completed but no instance IPs were found in output 'instance_ip_addr'."
-
-  - name: Add provisioned EC2 instances to in-memory inventory
-    ansible.builtin.add_host:
-      name: "{{ aws_name_tag | default('ec2') }}-{{ idx + 1 }}"
-      ansible_host: "{{ item }}"
-      ansible_user: "{{ input_ec2_ssh_user | default(ansible_user | default('ec2-user')) }}"
-      ansible_ssh_private_key_file: "{{ ansible_ssh_private_key_file | default(omit) }}"
-      groups: provisioned_ec2
-    loop: "{{ instance_ips }}"
-    loop_control:
-      index_var: idx
-
-- name: Deploy Parasol Insurance Website to provisioned EC2 instances
-  hosts: provisioned_ec2
-  become: true
-  gather_facts: false
   vars:
-    website_url: "https://github.com/ansible-tmm/parasol-website"
-    nginx_root: "/usr/share/nginx/html"
+    working_dir_name: "{{ input_tf_working_dir_name | default('provision_tf_resources') }}"
+    tf_plan_file_name: "{{ input_tf_plan_file_name | default('provision_tf_resources.tf') }}"
+    tf_vars_file_name: "{{ input_tf_vars_file_name | default('provision_tf_resources.auto.tfvars') }}"
+    tf_ansible_vars_file_name: "{{ input_tf_ansible_vars_file_name | default('provision_tf_resources.ansible.auto.tfvars') }}"
+    cloud_provider: "{{ input_cloud_provider | default('AWS') }}"
+    aws_ami_id: "ami-035032ea878eca201"  # RHEL 9.7 public AMI
 
   tasks:
-    - name: Wait for SSH to be available
-      ansible.builtin.wait_for_connection:
-        timeout: 300
-        delay: 5
 
-    - name: Add swap if none exists
-      ansible.builtin.shell: |
-        if ! swapon --show | grep -q .; then
-          fallocate -l 1G /swapfile
-          chmod 600 /swapfile
-          mkswap /swapfile
-          swapon /swapfile
-        fi
-      changed_when: false
+  - name: Validate Machine Credential SSH private key is available
+    ansible.builtin.fail:
+      msg: >
+        Attach a Machine Credential with SSH private key to this job template.
+        The key must match aws_instance_public_key and is passed to the
+        Terraform ansible provider as ansible_private_key.
+    when: ansible_ssh_private_key_file is not defined
 
-    - name: Install Nginx
-      ansible.builtin.dnf:
-        name: nginx
-        state: present
+  - name: Read SSH private key for Terraform ansible provider
+    ansible.builtin.slurp:
+      src: "{{ ansible_ssh_private_key_file }}"
+    register: tf_ansible_private_key
+    no_log: true
 
-    - name: Clear and recreate nginx web root
-      ansible.builtin.file:
-        path: "{{ nginx_root }}"
-        state: "{{ item }}"
-        mode: '0755'
-        owner: root
-        group: root
-      loop:
-        - absent
-        - directory
+  - name: Set Terraform ansible private key fact
+    ansible.builtin.set_fact:
+      ansible_private_key: "{{ tf_ansible_private_key.content | b64decode }}"
+    no_log: true
 
-    - name: Download and extract website
-      ansible.builtin.unarchive:
-        src: "{{ website_url }}/archive/refs/heads/main.tar.gz"
-        dest: "{{ nginx_root }}"
-        remote_src: true
-        extra_opts: ['--strip-components=1']
-        owner: root
-        group: root
+  - name: Make sure working directory exists
+    ansible.builtin.file:
+      path: /var/terraform/plans/{{ working_dir_name }}
+      state: directory
+      mode: '0755'
 
-    - name: Restore SELinux contexts on web root
-      ansible.builtin.command: restorecon -Rv {{ nginx_root }}
-      changed_when: false
+  - name: Make sure Terraform templates directory exists in working directory
+    ansible.builtin.file:
+      path: /var/terraform/plans/{{ working_dir_name }}/templates
+      state: directory
+      mode: '0755'
 
-    - name: Enable and start Nginx
-      ansible.builtin.systemd:
-        name: nginx
-        state: restarted
-        enabled: true
+  - name: Copy Ansible playbook into Terraform working directory
+    ansible.builtin.copy:
+      src: "{{ playbook_dir }}/install_nginx-rhel.yml"
+      dest: /var/terraform/plans/{{ working_dir_name }}/install_nginx-rhel.yml
+      mode: '0644'
+
+  - name: Copy Terraform inventory template into working directory
+    ansible.builtin.copy:
+      src: "../TF_templates/{{ cloud_provider }}/templates/provisioned_ec2_inventory.ini.tftpl"
+      dest: /var/terraform/plans/{{ working_dir_name }}/templates/provisioned_ec2_inventory.ini.tftpl
+      mode: '0644'
+
+  - name: Copy the Terraform ansible provider vars template
+    ansible.builtin.template:
+      src: "../TF_templates/{{ cloud_provider }}/{{ tf_ansible_vars_file_name }}.j2"
+      dest: /var/terraform/plans/{{ working_dir_name }}/{{ tf_ansible_vars_file_name }}
+      mode: '0600'
+    no_log: true
+
+- import_playbook: terraform_apply_plan.yml
