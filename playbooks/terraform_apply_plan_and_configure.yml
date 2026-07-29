@@ -12,24 +12,50 @@
 
   tasks:
 
-  - name: Validate Machine Credential SSH private key is available
-    ansible.builtin.fail:
-      msg: >
-        Attach a Machine Credential with SSH private key to this job template.
-        The key must match aws_instance_public_key and is passed to the
-        Terraform ansible provider as ansible_private_key.
-    when: ansible_ssh_private_key_file is not defined
+  - name: Resolve SSH private key file path from credential or extra vars
+    ansible.builtin.set_fact:
+      ec2_private_key_path: >-
+        {{
+          ansible_ssh_private_key_file | default('', true)
+          if (ansible_ssh_private_key_file | default('', true) | length > 0)
+          else input_ec2_ssh_private_key_file | default(aws_instance_private_key_file | default('', true), true)
+        }}
 
-  - name: Read SSH private key for Terraform ansible provider
-    ansible.builtin.slurp:
-      src: "{{ ansible_ssh_private_key_file }}"
-    register: tf_ansible_private_key
+  - name: Use SSH private key content supplied directly in extra vars
+    ansible.builtin.set_fact:
+      ansible_private_key: "{{ input_ansible_private_key | default(aws_instance_private_key) }}"
+    when:
+      - (input_ansible_private_key | default(aws_instance_private_key | default(''))) | length > 0
     no_log: true
 
-  - name: Set Terraform ansible private key fact
+  - name: Read SSH private key from file for Terraform ansible provider
+    ansible.builtin.slurp:
+      src: "{{ ec2_private_key_path }}"
+    register: tf_ansible_private_key
+    when:
+      - ansible_private_key is not defined
+      - ec2_private_key_path | length > 0
+    no_log: true
+
+  - name: Set Terraform ansible private key fact from file
     ansible.builtin.set_fact:
       ansible_private_key: "{{ tf_ansible_private_key.content | b64decode }}"
+    when:
+      - ansible_private_key is not defined
+      - tf_ansible_private_key is not skipped
+      - tf_ansible_private_key.content is defined
     no_log: true
+
+  - name: Validate Terraform ansible private key is available
+    ansible.builtin.assert:
+      that:
+        - ansible_private_key is defined
+        - ansible_private_key | length > 0
+      fail_msg: >
+        Provide the SSH private key matching aws_instance_public_key using one of:
+        - Machine Credential attached to this job template, or
+        - Extra var input_ansible_private_key / aws_instance_private_key (key content), or
+        - Extra var input_ec2_ssh_private_key_file / aws_instance_private_key_file (path to key file).
 
   - name: Make sure working directory exists
     ansible.builtin.file:
