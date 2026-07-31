@@ -1,18 +1,51 @@
 ---
-- name: Destroy aws resources using Terraform Cloud
+- name: Destroy aws resources using Terraform
   hosts: all
   gather_facts: false
+  vars:
+    working_dir_name: "{{ input_tf_working_dir_name | default('provision_tf_resources') }}"
+    tf_plan_file_name: "{{ input_tf_plan_file_name | default('provision_tf_resources.tf') }}"
+    tf_vars_file_name: "{{ input_tf_vars_file_name | default('provision_tf_resources.auto.tfvars') }}"
+    tf_ansible_vars_file_name: "{{ input_tf_ansible_vars_file_name | default('provision_tf_resources.ansible.auto.tfvars') }}"
+    cloud_provider: "{{ input_cloud_provider | default('AWS') }}"
+    tf_working_dir: "/var/terraform/plans/{{ working_dir_name }}"
+    tf_process_env:
+      TF_IN_AUTOMATION: "true"
+      AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') | default('', true) }}"
+      AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') | default('', true) }}"
+      AWS_SESSION_TOKEN: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default('', true) }}"
+      AWS_DEFAULT_REGION: "{{ aws_region | default(lookup('env', 'AWS_DEFAULT_REGION') | default('', true)) }}"
+
   tasks:
-  - name: Create a destroy run to remove resources
-    hashicorp.terraform.run:
-      tf_hostname: "{{ tf_hostname }}"
-      tf_validate_certs: false
-      tf_token: "{{ tf_token }}"
-      organization: "{{ tf_org }}"
-      workspace: "{{ tf_workspace }}"
-      run_message: "Destroy run to remove resources by Ansible"
-      is_destroy: true
-      auto_apply: true
-      poll_interval: 5
-      poll_timeout: 360
-      state: "present"
+
+  - name: Check Terraform state file exists from a prior apply
+    ansible.builtin.stat:
+      path: "{{ tf_working_dir }}/terraform.tfstate"
+    register: tf_state_file
+
+  - name: Fail when Terraform state is missing
+    ansible.builtin.fail:
+      msg: >
+        No terraform.tfstate found in {{ tf_working_dir }}.
+        Run the apply job template on the same execution node first, or use a
+        persistent working directory / remote state backend.
+    when: not tf_state_file.stat.exists
+
+  - name: Initialize Terraform working directory
+    ansible.builtin.command:
+      cmd: terraform init -input=false
+      chdir: "{{ tf_working_dir }}"
+    environment: "{{ tf_process_env }}"
+    changed_when: true
+
+  - name: Destroy Terraform-managed resources locally in the execution environment
+    ansible.builtin.command:
+      cmd: terraform destroy -auto-approve -input=false
+      chdir: "{{ tf_working_dir }}"
+    environment: "{{ tf_process_env }}"
+    register: tf_destroy
+
+  - name: Display Terraform destroy summary
+    ansible.builtin.debug:
+      msg: "{{ tf_destroy.stdout_lines[-20:] }}"
+    when: tf_destroy.stdout_lines is defined

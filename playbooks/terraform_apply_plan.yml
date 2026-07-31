@@ -6,72 +6,81 @@
     working_dir_name: "{{ input_tf_working_dir_name | default('provision_tf_resources') }}"
     tf_plan_file_name: "{{ input_tf_plan_file_name | default('provision_tf_resources.tf') }}"
     tf_vars_file_name: "{{ input_tf_vars_file_name | default('provision_tf_resources.auto.tfvars') }}"
-    cloud_provider: "{{ input_cloud_provider | default('AWS') }}" 
-#   
+    cloud_provider: "{{ input_cloud_provider | default('AWS') }}"
+    tf_working_dir: "/var/terraform/plans/{{ working_dir_name }}"
     aws_ami_id: "ami-035032ea878eca201"  # RHEL 9.7 public AMI
+    tf_process_env:
+      TF_IN_AUTOMATION: "true"
+      AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') | default('', true) }}"
+      AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') | default('', true) }}"
+      AWS_SESSION_TOKEN: "{{ lookup('env', 'AWS_SESSION_TOKEN') | default('', true) }}"
+      AWS_DEFAULT_REGION: "{{ aws_region | default(lookup('env', 'AWS_DEFAULT_REGION') | default('', true)) }}"
+
   tasks:
+
+  - name: Validate AWS credentials are available for Terraform
+    ansible.builtin.assert:
+      that:
+        - tf_process_env.AWS_ACCESS_KEY_ID | length > 0
+        - tf_process_env.AWS_SECRET_ACCESS_KEY | length > 0
+        - tf_process_env.AWS_DEFAULT_REGION | length > 0
+      fail_msg: >
+        Attach an Amazon AWS credential to this job template, or ensure
+        AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and aws_region are available.
 
   - name: Make sure working directory exists
     ansible.builtin.file:
-      path: /var/terraform/plans/{{ working_dir_name }}
+      path: "{{ tf_working_dir }}"
       state: directory
       mode: '0755'
 
   - name: Copy the TF Plan
     ansible.builtin.template:
       src: "../TF_templates/{{ cloud_provider }}/{{ tf_plan_file_name }}.j2"
-      dest: /var/terraform/plans/{{ working_dir_name }}/{{ tf_plan_file_name }}
+      dest: "{{ tf_working_dir }}/{{ tf_plan_file_name }}"
 
   - name: Copy the TF Vars Template
     ansible.builtin.template:
       src: "../TF_templates/{{ cloud_provider }}/{{ tf_vars_file_name }}.j2"
-      dest: /var/terraform/plans/{{ working_dir_name }}/{{ tf_vars_file_name }}
+      dest: "{{ tf_working_dir }}/{{ tf_vars_file_name }}"
 
-  - name: Create a new config version
-    hashicorp.terraform.configuration_version:
-      auto_queue_runs: false
-      tf_hostname: "{{ tf_hostname }}"
-      tf_validate_certs: false
-      tf_token: "{{ tf_token }}"
-      organization: "{{ tf_org }}"
-      workspace: "{{ tf_workspace }}"
-      state: present
-      configuration_files_path: /var/terraform/plans/{{ working_dir_name }}
+  - name: Initialize Terraform working directory
+    ansible.builtin.command:
+      cmd: terraform init -input=false
+      chdir: "{{ tf_working_dir }}"
+    environment: "{{ tf_process_env }}"
+    changed_when: true
 
-  - name: Create a new TF run and apply the changes
+  - name: Apply Terraform configuration locally in the execution environment
     block:
-      - name: Create a new TF run and apply the changes
-        hashicorp.terraform.run:
-          tf_hostname: "{{ tf_hostname }}"
-          tf_validate_certs: false
-          tf_token: "{{ tf_token }}"
-          organization: "{{ tf_org }}"
-          workspace: "{{ tf_workspace }}"
-          run_message: "New run to provision resources from Ansible"
-          auto_apply: true
-          poll_interval: 5
-          poll_timeout: 360
-          state: "present"
-        register: tf_run
-    rescue:
-      - name: Retrieve failed Terraform run details
-        hashicorp.terraform.run_info:
-          tf_hostname: "{{ tf_hostname }}"
-          tf_validate_certs: false
-          tf_token: "{{ tf_token }}"
-          organization: "{{ tf_org }}"
-          workspace: "{{ tf_workspace }}"
-          run_id: "{{ tf_run.run.id }}"
-        register: tf_run_info
-        when: tf_run.run.id is defined
+      - name: Apply Terraform configuration locally in the execution environment
+        ansible.builtin.command:
+          cmd: terraform apply -auto-approve -input=false
+          chdir: "{{ tf_working_dir }}"
+        environment: "{{ tf_process_env }}"
+        register: tf_apply
 
-      - name: Report Terraform Cloud run failure
+      - name: Display Terraform apply summary
+        ansible.builtin.debug:
+          msg: "{{ tf_apply.stdout_lines[-20:] | default([]) }}"
+        when: tf_apply.stdout_lines is defined
+
+      - name: Show Terraform outputs after apply
+        ansible.builtin.command:
+          cmd: terraform output
+          chdir: "{{ tf_working_dir }}"
+        environment: "{{ tf_process_env }}"
+        register: tf_outputs
+        changed_when: false
+
+      - name: Display Terraform outputs
+        ansible.builtin.debug:
+          msg: "{{ tf_outputs.stdout_lines | default([]) }}"
+
+    rescue:
+      - name: Report local Terraform apply failure
         ansible.builtin.fail:
           msg: >
-            Terraform Cloud run failed.
-            Run ID: {{ tf_run.run.id | default('unknown') }}.
-            Status: {{ tf_run.run.status | default('unknown') }}.
-            Open this run in Terraform Cloud for the full plan/apply log.
-            This branch uses resource ansible_playbook, which requires a self-hosted
-            Terraform Cloud agent with ansible-playbook installed. Default remote
-            runners do not support this resource.
+            Terraform apply failed in the AAP execution environment.
+            {{ tf_apply.stderr | default('Check job output above for terraform errors.') }}
+            Ensure the EE includes terraform, ansible-playbook, and openssh-clients.

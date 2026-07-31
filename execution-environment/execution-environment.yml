@@ -15,6 +15,7 @@ additional_build_steps:
   prepend_base:
     - RUN $PYCMD -m pip install --upgrade pip setuptools
   append_base:
+    - RUN microdnf install -y ansible-core openssh-clients
     - RUN curl "https://releases.hashicorp.com/terraform/1.14.1/terraform_1.14.1_linux_amd64.zip" -o "/terraform.zip"
     - RUN unzip /terraform.zip -d /terraform
     - RUN mv /terraform/terraform /bin
