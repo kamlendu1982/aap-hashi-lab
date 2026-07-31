@@ -72,5 +72,6 @@
             Run ID: {{ tf_run.run.id | default('unknown') }}.
             Status: {{ tf_run.run.status | default('unknown') }}.
             Open this run in Terraform Cloud for the full plan/apply log.
-            Common cause with the ansible provider: ansible_playbook cannot run on
-            Terraform Cloud remote runners because ansible-playbook is not installed there.
+            This branch uses resource ansible_playbook, which requires a self-hosted
+            Terraform Cloud agent with ansible-playbook installed. Default remote
+            runners do not support this resource.

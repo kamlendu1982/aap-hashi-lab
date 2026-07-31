@@ -29,8 +29,14 @@ variable "ansible_user" {
 
 variable "ansible_private_key" {
   type        = string
-  description = "SSH private key content matching public_key, used to build inventory on the Terraform runner."
+  description = "SSH private key content matching public_key, used by the ansible provider on the Terraform runner."
   sensitive   = true
+}
+
+variable "ansible_playbook_file" {
+  type        = string
+  description = "Playbook filename bundled in the uploaded Terraform configuration."
+  default     = "install_nginx-rhel.yml"
 }
 
 variable "region_name" {
@@ -161,6 +167,22 @@ resource "ansible_host" "ec2" {
   ]
 }
 
+resource "ansible_playbook" "install_nginx" {
+  playbook   = var.ansible_playbook_file
+  name       = "${var.name_tag}-1"
+  groups     = [ansible_group.provisioned_ec2.name]
+  replayable = true
+  args       = ["-i", local_file.ansible_inventory.filename]
+
+  depends_on = [
+    aws_instance.Terraform_Demo_EC2,
+    ansible_host.ec2,
+    ansible_group.provisioned_ec2,
+    local_file.ansible_inventory,
+    local_file.ansible_private_key,
+  ]
+}
+
 output "instance_ip_addr" {
   value       = formatlist("%v", aws_instance.Terraform_Demo_EC2[*].public_ip)
   description = "The Public IP address of the instance."
@@ -184,4 +206,10 @@ output "ansible_inventory_file" {
 output "ansible_host_names" {
   value       = [for i in range(var.instance_count) : "${var.name_tag}-${i + 1}"]
   description = "Ansible host names registered by the ansible provider."
+}
+
+output "ansible_playbook_stdout" {
+  value       = ansible_playbook.install_nginx.ansible_playbook_stdout
+  description = "Stdout from the ansible_playbook resource."
+  sensitive   = false
 }
