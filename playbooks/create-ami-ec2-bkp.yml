@@ -1,0 +1,29 @@
+---
+- name: Create AMI snapshot of an EC2 instance
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_region: "{{ aws_region }}"
+    instance_id: "{{ instance_id }}"
+    ami_name: "{{ ami_name_prefix }}-{{ ansible_date_time.iso8601_basic_short | default(lookup('pipe','date +%Y%m%dT%H%M%S')) }}"
+
+  tasks:
+    - name: Create AMI from the running instance
+      amazon.aws.ec2_ami:
+        region: "{{ aws_region }}"
+        instance_id: "{{ instance_id }}"
+        name: "{{ ami_name }}"
+        description: "Backup AMI of {{ instance_id }} created via AAP"
+        wait: "{{ wait_for_completion | default(true) }}"
+        # no_reboot=true avoids downtime but risks a crash-consistent (not
+        # application-consistent) image. Set false if you can tolerate a reboot.
+        no_reboot: "{{ no_reboot | default(true) }}"
+        tags:
+          Name: "{{ ami_name }}"
+          SourceInstance: "{{ instance_id }}"
+          CreatedBy: "AAP"
+      register: ami_result
+
+    - name: Show the resulting AMI ID
+      ansible.builtin.debug:
+        msg: "Created AMI {{ ami_result.image_id }} from instance {{ instance_id }}. Save this AMI ID to restore later."
