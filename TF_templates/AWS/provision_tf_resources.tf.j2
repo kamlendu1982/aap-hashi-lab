@@ -28,10 +28,10 @@ variable "instance_type" {
   description = "The EC2 instance type that will be used to create new EC2 instances."
 }
 
-variable "instance_count" {
-  type        = number
-  description = "The number of EC2 instances to create."
-  default     = 1
+variable "instance_names" {
+  type        = list(string)
+  description = "Unique name for each EC2 instance. Each entry becomes its own state resource for targeted apply/destroy."
+  default     = ["instance-1"]
 }
 
 variable "public_key" {
@@ -80,31 +80,37 @@ resource "aws_key_pair" "Terraform_Demo_Key" {
   public_key = var.public_key
 }
 
+# One-time migration helper when upgrading from count-based instances.
+moved {
+  from = aws_instance.Terraform_Demo_EC2[0]
+  to   = aws_instance.Terraform_Demo_EC2["instance-1"]
+}
+
 resource "aws_instance" "Terraform_Demo_EC2" {
-  count         = var.instance_count
-  ami           = var.ami_id
-  instance_type = var.instance_type
+  for_each        = toset(var.instance_names)
+  ami             = var.ami_id
+  instance_type   = var.instance_type
   security_groups = [aws_security_group.Terraform_Demo_SG.name]
-  key_name = "${var.name_tag}-keypair"
+  key_name        = "${var.name_tag}-keypair"
   tags = {
-                Name = "${var.name_tag}-${count.index + 1}"
-                Provisioner = "Terraform"
-                Manager = "Ansible"
-        }
+    Name        = "${var.name_tag}-${each.key}"
+    Provisioner = "Terraform"
+    Manager     = "Ansible"
   }
+}
 
 output "instance_ip_addr" {
-  value       = "${formatlist("%v", aws_instance.Terraform_Demo_EC2.*.public_ip)}"
-  description = "The Public IP address of the instance."
+  value       = { for k, v in aws_instance.Terraform_Demo_EC2 : k => v.public_ip }
+  description = "Public IP address of each instance, keyed by instance name."
 }
 
 output "instance_public_dns" {
-  value       = "${formatlist("%v", aws_instance.Terraform_Demo_EC2.*.public_dns)}"
-  description = "The Public DNS of the instance."
+  value       = { for k, v in aws_instance.Terraform_Demo_EC2 : k => v.public_dns }
+  description = "Public DNS of each instance, keyed by instance name."
 }
 
 output "instance_tags" {
-  value       = "${formatlist("%v", aws_instance.Terraform_Demo_EC2.*.tags_all)}"
-  description = "The tags of the instance."
+  value       = { for k, v in aws_instance.Terraform_Demo_EC2 : k => v.tags_all }
+  description = "Tags of each instance, keyed by instance name."
 }
 

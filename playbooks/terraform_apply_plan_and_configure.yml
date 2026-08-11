@@ -141,20 +141,18 @@
       name: instance_ip_addr
     register: tf_instance_ips
 
-  - name: Set instance IP list from Terraform output
+  - name: Set instance IP map from Terraform output
     ansible.builtin.set_fact:
-      instance_ips: "{{ tf_instance_ips.output.value }}"
+      instance_ips: "{{ tf_instance_ips.output.value | dict2items }}"
 
   - name: Add provisioned EC2 instances to in-memory inventory
     ansible.builtin.add_host:
-      name: "{{ aws_name_tag | default('ec2') }}-{{ idx + 1 }}"
-      ansible_host: "{{ item }}"
+      name: "{{ aws_name_tag | default('ec2') }}-{{ item.key }}"
+      ansible_host: "{{ item.value }}"
       ansible_user: "{{ ec2_ssh_user }}"
       ansible_ssh_private_key_file: "{{ ec2_ssh_private_key_file }}"
       groups: provisioned_ec2
     loop: "{{ instance_ips }}"
-    loop_control:
-      index_var: idx
 
 - name: Deploy Parasol Insurance Website to provisioned EC2 instances
   hosts: provisioned_ec2
