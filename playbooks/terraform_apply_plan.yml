@@ -39,38 +39,14 @@
       configuration_files_path: /var/terraform/plans/{{ working_dir_name }}
 
   - name: Create a new TF run and apply the changes
-    block:
-      - name: Create a new TF run and apply the changes
-        hashicorp.terraform.run:
-          tf_hostname: "{{ tf_hostname }}"
-          tf_validate_certs: false
-          tf_token: "{{ tf_token }}"
-          organization: "{{ tf_org }}"
-          workspace: "{{ tf_workspace }}"
-          run_message: "New run to provision resources from Ansible"
-          auto_apply: true
-          poll_interval: 5
-          poll_timeout: 360
-          state: "present"
-        register: tf_run
-    rescue:
-      - name: Retrieve failed Terraform run details
-        hashicorp.terraform.run_info:
-          tf_hostname: "{{ tf_hostname }}"
-          tf_validate_certs: false
-          tf_token: "{{ tf_token }}"
-          organization: "{{ tf_org }}"
-          workspace: "{{ tf_workspace }}"
-          run_id: "{{ tf_run.run.id }}"
-        register: tf_run_info
-        when: tf_run.run.id is defined
-
-      - name: Report Terraform Cloud run failure
-        ansible.builtin.fail:
-          msg: >
-            Terraform Cloud run failed.
-            Run ID: {{ tf_run.run.id | default('unknown') }}.
-            Status: {{ tf_run.run.status | default('unknown') }}.
-            Open this run in Terraform Cloud for the full plan/apply log.
-            Common cause with the ansible provider: ansible_playbook cannot run on
-            Terraform Cloud remote runners because ansible-playbook is not installed there.
+    hashicorp.terraform.run:
+      tf_hostname: "{{ tf_hostname }}"
+      tf_validate_certs: false
+      tf_token: "{{ tf_token }}"
+      organization: "{{ tf_org }}"
+      workspace: "{{ tf_workspace }}"
+      run_message: "New run to provision resources from Ansible"
+      auto_apply: true
+      poll_interval: 5
+      poll_timeout: 360
+      state: "present"
