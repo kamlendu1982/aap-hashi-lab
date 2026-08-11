@@ -1,6 +1,38 @@
-region_name = "{{ aws_region }}"
-name_tag = "{{ aws_name_tag }}"
-ami_id = "{{ aws_ami_id }}"
-instance_type = "{{ aws_instance_size }}"
-instance_count = {{ aws_instance_count }}
-public_key = "{{ aws_instance_public_key }}"
+# Replace instance_count with a list of names — each becomes an
+# individually-addressable resource (aws_instance.Terraform_Demo_EC2["name"])
+variable "instance_names" {
+  type        = list(string)
+  description = "Unique name for each EC2 instance to create. Each entry becomes its own state resource, so it can be targeted individually for apply/destroy."
+  default     = ["instance-1"]
+}
+
+# ... (region_name, name_tag, ami_id, instance_type, public_key unchanged) ...
+
+resource "aws_instance" "Terraform_Demo_EC2" {
+  for_each        = toset(var.instance_names)
+  ami             = var.ami_id
+  instance_type   = var.instance_type
+  security_groups = [aws_security_group.Terraform_Demo_SG.name]
+  key_name        = "${var.name_tag}-keypair"
+
+  tags = {
+    Name        = "${var.name_tag}-${each.key}"
+    Provisioner = "Terraform"
+    Manager     = "Ansible"
+  }
+}
+
+output "instance_ip_addr" {
+  value       = { for k, v in aws_instance.Terraform_Demo_EC2 : k => v.public_ip }
+  description = "Public IP address of each instance, keyed by instance name."
+}
+
+output "instance_public_dns" {
+  value       = { for k, v in aws_instance.Terraform_Demo_EC2 : k => v.public_dns }
+  description = "Public DNS of each instance, keyed by instance name."
+}
+
+output "instance_tags" {
+  value       = { for k, v in aws_instance.Terraform_Demo_EC2 : k => v.tags_all }
+  description = "Tags of each instance, keyed by instance name."
+}

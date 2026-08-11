@@ -1,18 +1,46 @@
 ---
-- name: Destroy aws resources using Terraform Cloud
+- name: Destroy a single aws resource using Terraform Cloud
   hosts: all
   gather_facts: false
+  vars:
+    # Pass in the specific instance name to remove, e.g. "web-2"
+    target_instance_name: "{{ input_target_instance_name }}"
+    target_resource_address: 'aws_instance.Terraform_Demo_EC2["{{ target_instance_name }}"]'
+
   tasks:
-  - name: Create a destroy run to remove resources
-    hashicorp.terraform.run:
-      tf_hostname: "{{ tf_hostname }}"
-      tf_validate_certs: false
-      tf_token: "{{ tf_token }}"
-      organization: "{{ tf_org }}"
-      workspace: "{{ tf_workspace }}"
-      run_message: "Destroy run to remove resources by Ansible"
-      is_destroy: true
-      auto_apply: true
-      poll_interval: 5
-      poll_timeout: 360
-      state: "present"
+    - name: Scope the destroy run to a single resource via TF_CLI_ARGS_plan
+      hashicorp.terraform.variable:
+        tf_hostname: "{{ tf_hostname }}"
+        tf_validate_certs: false
+        tf_token: "{{ tf_token }}"
+        organization: "{{ tf_org }}"
+        workspace: "{{ tf_workspace }}"
+        key: "TF_CLI_ARGS_plan"
+        value: "-target={{ target_resource_address }}"
+        category: "env"
+        description: "Set by Ansible to scope a targeted destroy run"
+        state: present
+
+    - name: Create a destroy run to remove only the targeted resource
+      hashicorp.terraform.run:
+        tf_hostname: "{{ tf_hostname }}"
+        tf_validate_certs: false
+        tf_token: "{{ tf_token }}"
+        organization: "{{ tf_org }}"
+        workspace: "{{ tf_workspace }}"
+        run_message: "Targeted destroy of {{ target_resource_address }} by Ansible"
+        is_destroy: true
+        auto_apply: true
+        poll_interval: 5
+        poll_timeout: 360
+        state: "present"
+
+    - name: Clear the targeting variable so future runs act on the full config
+      hashicorp.terraform.variable:
+        tf_hostname: "{{ tf_hostname }}"
+        tf_validate_certs: false
+        tf_token: "{{ tf_token }}"
+        organization: "{{ tf_org }}"
+        workspace: "{{ tf_workspace }}"
+        key: "TF_CLI_ARGS_plan"
+        state: absent
