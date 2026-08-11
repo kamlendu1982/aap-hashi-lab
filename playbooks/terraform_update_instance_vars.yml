@@ -1,0 +1,97 @@
+---
+- name: Update instance_names Terraform variable after a targeted destroy
+  hosts: all
+  gather_facts: false
+  vars:
+    # Full list of instance names that existed BEFORE this destroy
+    # e.g. ["instance-1", "instance-2"] — pass this at workflow launch/survey
+    current_instance_names: "{{ input_instance_names }}"
+    # The instance that was just destroyed, e.g. "instance-2"
+    target_instance_name: "{{ input_target_instance_name }}"
+    updated_instance_names: "{{ current_instance_names | reject('equalto', target_instance_name) | list }}"
+    tfc_api_base: >-
+      {{
+        tf_hostname if (tf_hostname is match('^https?://'))
+        else 'https://' ~ tf_hostname
+      }}
+
+  tasks:
+    - name: Fail fast if the target isn't in the current list
+      ansible.builtin.fail:
+        msg: "{{ target_instance_name }} not found in {{ current_instance_names }}"
+      when: target_instance_name not in current_instance_names
+
+    - name: Look up Terraform Cloud workspace ID
+      ansible.builtin.uri:
+        url: "{{ tfc_api_base }}/api/v2/organizations/{{ tf_org }}/workspaces/{{ tf_workspace }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ tf_token }}"
+          Content-Type: application/vnd.api+json
+        validate_certs: "{{ tf_validate_certs | default(false) }}"
+        return_content: true
+      register: tfc_workspace
+
+    - name: List workspace Terraform variables
+      ansible.builtin.uri:
+        url: "{{ tfc_api_base }}/api/v2/workspaces/{{ tfc_workspace.json.data.id }}/vars"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ tf_token }}"
+          Content-Type: application/vnd.api+json
+        validate_certs: "{{ tf_validate_certs | default(false) }}"
+        return_content: true
+      register: tfc_workspace_vars
+
+    - name: Find existing instance_names workspace variable
+      ansible.builtin.set_fact:
+        tfc_instance_names_var: >-
+          {{
+            tfc_workspace_vars.json.data
+            | selectattr('attributes.key', 'equalto', 'instance_names')
+            | selectattr('attributes.category', 'equalto', 'terraform')
+            | list
+            | first
+            | default({}, true)
+          }}
+
+    - name: Create instance_names workspace variable
+      ansible.builtin.uri:
+        url: "{{ tfc_api_base }}/api/v2/workspaces/{{ tfc_workspace.json.data.id }}/vars"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ tf_token }}"
+          Content-Type: application/vnd.api+json
+        validate_certs: "{{ tf_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          data:
+            type: vars
+            attributes:
+              key: instance_names
+              value: "{{ updated_instance_names | to_json }}"
+              description: "Managed by Ansible — updated after destroying {{ target_instance_name }}"
+              category: terraform
+              hcl: true
+        status_code: 201
+      when: tfc_instance_names_var.id is not defined
+
+    - name: Update instance_names workspace variable
+      ansible.builtin.uri:
+        url: "{{ tfc_api_base }}/api/v2/workspaces/{{ tfc_workspace.json.data.id }}/vars/{{ tfc_instance_names_var.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ tf_token }}"
+          Content-Type: application/vnd.api+json
+        validate_certs: "{{ tf_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          data:
+            type: vars
+            id: "{{ tfc_instance_names_var.id }}"
+            attributes:
+              value: "{{ updated_instance_names | to_json }}"
+              description: "Managed by Ansible — updated after destroying {{ target_instance_name }}"
+              hcl: true
+        status_code: 200
+      when: tfc_instance_names_var.id is defined
