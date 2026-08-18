@@ -1,0 +1,104 @@
+---
+- name: Deploy Flask app on RHEL 9 with Gunicorn
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    app_name: parasol-api
+    app_dir: /opt/{{ app_name }}
+    app_port: 8080
+
+  pre_tasks:
+    - name: Wait for SSH to be available
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        delay: 5
+
+    - name: Add swap if none exists
+      ansible.builtin.shell: |
+        if ! swapon --show | grep -q .; then
+          fallocate -l 1G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+        fi
+      changed_when: false
+
+  tasks:
+    - name: Install Python and firewall tools
+      ansible.builtin.dnf:
+        name:
+          - python3
+          - python3-pip
+          - firewalld
+        state: present
+
+    - name: Install Flask and Gunicorn
+      ansible.builtin.pip:
+        name:
+          - flask
+          - gunicorn
+        executable: pip3
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Deploy Flask application
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/app.py"
+        mode: "0644"
+        content: |
+          from flask import Flask, jsonify
+          import socket
+          app = Flask(__name__)
+
+          @app.route("/")
+          def home():
+              return f"<h1>Parasol API</h1><p>Host: {socket.gethostname()}</p>"
+
+          @app.route("/health")
+          def health():
+              return jsonify(status="ok", host=socket.gethostname())
+
+    - name: Deploy systemd service
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ app_name }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Parasol Flask API
+          After=network.target
+
+          [Service]
+          WorkingDirectory={{ app_dir }}
+          ExecStart=/usr/local/bin/gunicorn -b 0.0.0.0:{{ app_port }} app:app
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart app
+
+    - name: Allow app port through firewalld
+      ansible.posix.firewalld:
+        port: "{{ app_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      when: ansible_facts.services['firewalld.service']['state'] | default('stopped') == 'running'
+
+    - name: Enable and start application
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: Restart app
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: true
