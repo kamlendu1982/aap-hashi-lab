@@ -1,0 +1,323 @@
+---
+# Create an AAP 2.6 workflow: Terraform Apply -> Inventory Sync -> Install app (Nginx or Flask)
+#
+# Uses Platform Gateway API path: /api/controller/v2/
+#
+# Run:
+#   ansible-galaxy collection install -r requirements.yml
+#   cp vars.example.yml vars.yml   # set gateway hostname (no https://)
+#   ansible-playbook create_provision_workflow.yml -e @vars.yml
+
+- name: Create provision-and-deploy workflow in AAP
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars.yml
+
+  vars:
+    aap_use_token: "{{ (aap_oauth_token | default('') | length) > 0 }}"
+    aap_api_path: "/api/controller/v2"
+    workflow_node_ids:
+      terraform_apply: terraform_apply
+      inventory_sync: inventory_sync
+      install_app: install_app
+      install_nginx_legacy: install_nginx
+
+  tasks:
+    - name: Validate AAP credentials are provided
+      ansible.builtin.assert:
+        that:
+          - (aap_oauth_token | default('') | length > 0) or
+            ((aap_username | default('') | length > 0) and (aap_password | default('') | length > 0))
+        fail_msg: >
+          Set aap_oauth_token or both aap_username and aap_password in vars.yml
+
+    - name: Validate application install selection
+      ansible.builtin.assert:
+        that:
+          - aap_jt_install in ['Nginx', 'Flask']
+        fail_msg: >
+          Set aap_jt_install to 'Nginx' or 'Flask' in vars.yml (current: '{{ aap_jt_install | default('') }}').
+
+    - name: Resolve selected application install job template name
+      ansible.builtin.set_fact:
+        aap_jt_install_selected: >-
+          {{
+            aap_jt_install_nginx if aap_jt_install == 'Nginx'
+            else aap_jt_install_flask
+          }}
+
+    - name: Normalize Platform Gateway hostname
+      ansible.builtin.set_fact:
+        aap_hostname_clean: >-
+          {{
+            aap_hostname
+            | regex_replace('^https?://', '')
+            | regex_replace('/api/controller/v2/?$', '')
+            | regex_replace('/api/v2/?$', '')
+            | regex_replace('/+$', '')
+          }}
+
+    - name: Set API base URL for AAP 2.6 gateway
+      ansible.builtin.set_fact:
+        aap_api_base: "https://{{ aap_hostname_clean }}{{ aap_api_path }}"
+
+    - name: Create ephemeral API token from username and password
+      ansible.controller.token:
+        controller_host: "{{ aap_hostname_clean }}"
+        controller_username: "{{ aap_username }}"
+        controller_password: "{{ aap_password }}"
+        validate_certs: "{{ aap_validate_certs | default(true) }}"
+        description: Ephemeral token for aap-config workflow builder
+        scope: write
+      register: ephemeral_token
+      when: not aap_use_token
+
+    - name: Set bearer token for API calls from OAuth token
+      ansible.builtin.set_fact:
+        aap_api_token: "{{ aap_oauth_token }}"
+        controller_connection:
+          controller_host: "{{ aap_hostname_clean }}"
+          controller_oauthtoken: "{{ aap_oauth_token }}"
+          validate_certs: "{{ aap_validate_certs | default(true) }}"
+      when: aap_use_token
+
+    - name: Set bearer token for API calls from ephemeral controller token
+      ansible.builtin.set_fact:
+        aap_api_token: "{{ controller_token.token }}"
+        controller_connection:
+          controller_host: "{{ aap_hostname_clean }}"
+          controller_oauthtoken: "{{ controller_token }}"
+          validate_certs: "{{ aap_validate_certs | default(true) }}"
+      when: not aap_use_token
+
+    - name: Resolve organization ID
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/organizations/"
+        method: GET
+        validate_certs: "{{ aap_validate_certs | default(true) }}"
+        headers:
+          Authorization: "Bearer {{ aap_api_token }}"
+        return_content: true
+      register: org_query
+
+    - name: Select organization record
+      ansible.builtin.set_fact:
+        aap_organization_id: "{{ org_match.id | default('') | string }}"
+      vars:
+        org_match: >-
+          {{
+            org_query.json.results
+            | selectattr('name', 'equalto', aap_organization)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Fail when organization is missing
+      ansible.builtin.fail:
+        msg: >
+          Organization '{{ aap_organization }}' was not found in AAP.
+          Available: {{ org_query.json.results | map(attribute='name') | list }}
+      when: aap_organization_id | length == 0
+
+    - name: Look up Terraform Apply job template
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/job_templates/"
+        method: GET
+        validate_certs: "{{ aap_validate_certs | default(true) }}"
+        headers:
+          Authorization: "Bearer {{ aap_api_token }}"
+        return_content: true
+      register: jt_terraform_query
+
+    - name: Select Terraform Apply job template
+      ansible.builtin.set_fact:
+        aap_jt_terraform_apply_id: "{{ terraform_jt_match.id | default('') | string }}"
+      vars:
+        terraform_jt_match: >-
+          {{
+            jt_terraform_query.json.results
+            | selectattr('name', 'equalto', aap_jt_terraform_apply)
+            | selectattr('organization', 'equalto', aap_organization_id | int)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Look up application install job template
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/job_templates/"
+        method: GET
+        validate_certs: "{{ aap_validate_certs | default(true) }}"
+        headers:
+          Authorization: "Bearer {{ aap_api_token }}"
+        return_content: true
+      register: jt_install_query
+
+    - name: Select application install job template
+      ansible.builtin.set_fact:
+        aap_jt_install_id: "{{ install_jt_match.id | default('') | string }}"
+      vars:
+        install_jt_match: >-
+          {{
+            jt_install_query.json.results
+            | selectattr('name', 'equalto', aap_jt_install_selected)
+            | selectattr('organization', 'equalto', aap_organization_id | int)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Look up inventory source for sync node
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/inventory_sources/"
+        method: GET
+        validate_certs: "{{ aap_validate_certs | default(true) }}"
+        headers:
+          Authorization: "Bearer {{ aap_api_token }}"
+        return_content: true
+      register: inv_source_query
+
+    - name: Select inventory source
+      ansible.builtin.set_fact:
+        aap_inventory_source_id: "{{ inv_source_match.id | default('') | string }}"
+      vars:
+        inv_source_match: >-
+          {{
+            inv_source_query.json.results
+            | selectattr('name', 'equalto', aap_inventory_source)
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Fail with helpful message when referenced AAP objects are missing
+      ansible.builtin.fail:
+        msg: |
+          One or more AAP objects in vars.yml could not be found via {{ aap_api_base }}.
+
+          Terraform JT '{{ aap_jt_terraform_apply }}': {{ 'found (id ' ~ aap_jt_terraform_apply_id ~ ')' if aap_jt_terraform_apply_id | length > 0 else 'NOT FOUND' }}
+          Install JT ({{ aap_jt_install }} -> '{{ aap_jt_install_selected }}'): {{ 'found (id ' ~ aap_jt_install_id ~ ')' if aap_jt_install_id | length > 0 else 'NOT FOUND' }}
+          Inventory source '{{ aap_inventory_source }}': {{ 'found (id ' ~ aap_inventory_source_id ~ ')' if aap_inventory_source_id | length > 0 else 'NOT FOUND' }}
+
+          Job templates in org {{ aap_organization }}:
+          {{ jt_terraform_query.json.results | selectattr('organization', 'equalto', aap_organization_id | int) | map(attribute='name') | list }}
+
+          Inventory sources:
+          {{ inv_source_query.json.results | map(attribute='name') | list }}
+
+          Fix the names in vars.yml to match AAP exactly.
+      when: >
+        aap_jt_terraform_apply_id | length == 0 or
+        aap_jt_install_id | length == 0 or
+        aap_inventory_source_id | length == 0
+
+    - name: Create or update workflow job template
+      ansible.controller.workflow_job_template:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        name: "{{ aap_workflow_name }}"
+        description: >-
+          Terraform apply, AWS inventory sync, then {{ aap_jt_install }} deployment
+          ({{ aap_jt_install_selected }})
+        organization: "{{ aap_organization }}"
+        inventory: "{{ aap_inventory }}"
+        survey_enabled: false
+        ask_inventory_on_launch: false
+        ask_variables_on_launch: true
+        state: present
+
+    - name: Create workflow node - Terraform Apply
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        organization: "{{ aap_organization }}"
+        lookup_organization: "{{ aap_organization }}"
+        workflow_job_template: "{{ aap_workflow_name }}"
+        identifier: "{{ workflow_node_ids.terraform_apply }}"
+        unified_job_template: "{{ aap_jt_terraform_apply_id }}"
+        state: present
+
+    - name: Create workflow node - Inventory Sync
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        organization: "{{ aap_organization }}"
+        lookup_organization: "{{ aap_organization }}"
+        workflow_job_template: "{{ aap_workflow_name }}"
+        identifier: "{{ workflow_node_ids.inventory_sync }}"
+        unified_job_template: "{{ aap_inventory_source_id }}"
+        state: present
+
+    - name: Remove legacy install_nginx workflow node if present
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        organization: "{{ aap_organization }}"
+        workflow_job_template: "{{ aap_workflow_name }}"
+        identifier: "{{ workflow_node_ids.install_nginx_legacy }}"
+        state: absent
+
+    - name: Create workflow node - Install application
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        organization: "{{ aap_organization }}"
+        lookup_organization: "{{ aap_organization }}"
+        workflow_job_template: "{{ aap_workflow_name }}"
+        identifier: "{{ workflow_node_ids.install_app }}"
+        unified_job_template: "{{ aap_jt_install_id }}"
+        state: present
+
+    - name: Link Terraform Apply to Inventory Sync on success
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        organization: "{{ aap_organization }}"
+        workflow_job_template: "{{ aap_workflow_name }}"
+        identifier: "{{ workflow_node_ids.terraform_apply }}"
+        success_nodes:
+          - "{{ workflow_node_ids.inventory_sync }}"
+        state: present
+
+    - name: Link Inventory Sync to Install application on success
+      ansible.controller.workflow_job_template_node:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        organization: "{{ aap_organization }}"
+        workflow_job_template: "{{ aap_workflow_name }}"
+        identifier: "{{ workflow_node_ids.inventory_sync }}"
+        success_nodes:
+          - "{{ workflow_node_ids.install_app }}"
+        state: present
+
+    - name: Show workflow details
+      ansible.builtin.debug:
+        msg:
+          - "Gateway: https://{{ aap_hostname_clean }}"
+          - "API base: {{ aap_api_base }}"
+          - "Workflow '{{ aap_workflow_name }}' is ready in organization '{{ aap_organization }}'."
+          - "Application: {{ aap_jt_install }} -> {{ aap_jt_install_selected }} (id {{ aap_jt_install_id }})"
+          - "Graph: {{ aap_jt_terraform_apply }} ({{ aap_jt_terraform_apply_id }}) -> {{ aap_inventory_source }} ({{ aap_inventory_source_id }}) -> {{ aap_jt_install_selected }} ({{ aap_jt_install_id }})"
+
+    - name: Revoke ephemeral API token
+      ansible.controller.token:
+        controller_host: "{{ controller_connection.controller_host }}"
+        controller_oauthtoken: "{{ controller_connection.controller_oauthtoken }}"
+        validate_certs: "{{ controller_connection.validate_certs }}"
+        existing_token: "{{ controller_token }}"
+        state: absent
+      when:
+        - not aap_use_token
+        - controller_token is defined
+        - controller_token.token is defined

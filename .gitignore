@@ -23,6 +23,7 @@ www/
 
 # Ignore sensitive or private information
 secrets.json
+aap-config/vars.yml
 
 # Ignore compiled binaries or executables
 *.exe
