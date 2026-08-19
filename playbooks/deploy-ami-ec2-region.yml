@@ -17,6 +17,8 @@
 # Optional:
 #   skip_ami_copy: true    Use target_ami_id instead of copying again
 #   target_ami_id          Already-copied AMI in aws_target_region
+#   ami_copy_ready_retries Poll attempts before copy (default 30)
+#   ami_copy_ready_delay   Seconds between polls (default 20)
 #   aws_target_vpc_id      Default VPC used if omitted
 #   aws_target_subnet_id   Default public subnet used if omitted
 #   migrated_instance_name default: instance-1
@@ -30,7 +32,6 @@
   gather_facts: false
 
   vars:
-    aws_source_region: "{{ aws_source_region | default(aws_region) }}"
     migrated_instance_name: "{{ input_migrated_instance_name | default('instance-1') }}"
     resource_prefix: "{{ aws_name_tag }}"
     security_group_name: "{{ resource_prefix }}-sg"
@@ -40,48 +41,128 @@
     do_copy_ami: "{{ not (skip_ami_copy | default(false) | bool) }}"
 
   tasks:
+    - name: Resolve source AMI and region from workflow artifacts
+      ansible.builtin.set_fact:
+        resolved_source_ami_id: "{{ migration_source_ami_id | default(source_ami_id | default('')) }}"
+        resolved_source_region: >-
+          {{
+            migration_source_region
+            | default(aws_source_region | default('', true), true)
+            | default(
+                aws_region if (
+                  aws_region is defined
+                  and aws_region | length > 0
+                  and aws_region != aws_target_region
+                ) else '',
+                true
+              )
+          }}
+
+    - name: Sanitize workflow and survey values
+      ansible.builtin.set_fact:
+        resolved_source_ami_id: >-
+          {{
+            resolved_source_ami_id
+            | string
+            | trim
+            | regex_replace('[\r\n\t]+', '')
+            | regex_replace('\s+$', '')
+            | regex_replace('^\s+', '')
+          }}
+        resolved_source_region: >-
+          {{
+            resolved_source_region
+            | string
+            | trim
+            | regex_replace('[\r\n\t]+', '')
+            | regex_replace('\s+$', '')
+            | regex_replace('^\s+', '')
+          }}
+        resolved_target_region: >-
+          {{
+            aws_target_region
+            | string
+            | trim
+            | regex_replace('[\r\n\t]+', '')
+            | regex_replace('\s+$', '')
+            | regex_replace('^\s+', '')
+          }}
+        sanitized_target_ami_id: >-
+          {{
+            (target_ami_id | default(''))
+            | string
+            | trim
+            | regex_replace('[\r\n\t]+', '')
+            | regex_replace('\s+$', '')
+            | regex_replace('^\s+', '')
+          }}
+
+    - name: Show resolved migration source values
+      ansible.builtin.debug:
+        msg:
+          - "Resolved source AMI: '{{ resolved_source_ami_id }}' (length {{ resolved_source_ami_id | length }})"
+          - "Resolved source region: '{{ resolved_source_region }}'"
+          - "Target region: '{{ resolved_target_region }}'"
+          - "Workflow artifact migration_source_region: {{ migration_source_region | default('not set') }}"
+          - "Workflow artifact aws_source_region: {{ aws_source_region | default('not set') }}"
+          - "Survey/extra aws_region: {{ aws_region | default('not set') }}"
+          - "Raw source_ami_id length: {{ (source_ami_id | default('')) | string | length }}"
+          - "Sanitized AMI id changed: {{ ((source_ami_id | default('')) | string | trim | regex_replace('[\r\n\t]+', '') | length) != (resolved_source_ami_id | length) }}"
+
     - name: Validate required migration variables
       ansible.builtin.assert:
         that:
-          - source_ami_id is defined
-          - source_ami_id | length > 0
-          - aws_source_region is defined
-          - aws_source_region | length > 0
-          - aws_target_region is defined
-          - aws_target_region | length > 0
+          - resolved_source_ami_id | length > 0
+          - resolved_source_region | length > 0
+          - resolved_target_region is defined
+          - resolved_target_region | length > 0
           - aws_name_tag is defined
           - aws_name_tag | length > 0
           - aws_instance_public_key is defined
           - aws_instance_public_key | length > 0
           - aws_instance_size is defined
           - aws_instance_size | length > 0
-          - aws_source_region != aws_target_region
-          - (do_copy_ami | bool) or (target_ami_id is defined and target_ami_id | length > 0)
+          - resolved_source_region != resolved_target_region
+          - (do_copy_ami | bool) or (sanitized_target_ami_id | length > 0)
         fail_msg: >
-          Provide source_ami_id, aws_source_region, aws_target_region, aws_name_tag,
-          aws_instance_public_key, aws_instance_size. Regions must differ.
-          When skip_ami_copy=true, also provide target_ami_id.
+          Provide source AMI via workflow artifacts (migration_source_ami_id /
+          migration_source_region) or extra vars source_ami_id + aws_source_region.
+          aws_region is only used as fallback when it differs from aws_target_region.
+          Survey tip: aws_region = where EC2/AMI was created; aws_target_region = migrate to.
+
+    - name: Wait for source AMI to become available before copy
+      amazon.aws.ec2_ami_info:
+        region: "{{ resolved_source_region }}"
+        image_ids:
+          - "{{ resolved_source_ami_id }}"
+      register: source_ami_wait
+      until:
+        - source_ami_wait.images | default([]) | length > 0
+        - source_ami_wait.images[0].state == 'available'
+      retries: "{{ ami_copy_ready_retries | default(30) }}"
+      delay: "{{ ami_copy_ready_delay | default(20) }}"
+      when: do_copy_ami | bool
 
     - name: Copy AMI from source region to target region
       community.aws.ec2_ami_copy:
-        source_region: "{{ aws_source_region }}"
-        source_image_id: "{{ source_ami_id }}"
-        region: "{{ aws_target_region }}"
+        source_region: "{{ resolved_source_region }}"
+        source_image_id: "{{ resolved_source_ami_id }}"
+        region: "{{ resolved_target_region }}"
         name: "{{ ami_copy_name }}"
-        description: "Regional copy of {{ source_ami_id }} from {{ aws_source_region }}"
+        description: "Regional copy of {{ resolved_source_ami_id }} from {{ resolved_source_region }}"
         wait: true
         wait_timeout: "{{ ami_copy_wait_timeout | default(1200) }}"
         tags:
           Name: "{{ ami_copy_name }}"
-          SourceAMI: "{{ source_ami_id }}"
-          SourceRegion: "{{ aws_source_region }}"
+          SourceAMI: "{{ resolved_source_ami_id }}"
+          SourceRegion: "{{ resolved_source_region }}"
           CreatedBy: AAP
       register: ami_copy_result
       when: do_copy_ami | bool
 
     - name: Use pre-copied target AMI
       ansible.builtin.set_fact:
-        deploy_ami_id: "{{ target_ami_id }}"
+        deploy_ami_id: "{{ sanitized_target_ami_id }}"
       when: not (do_copy_ami | bool)
 
     - name: Set deployed AMI id from copy result
@@ -91,7 +172,7 @@
 
     - name: Look up default VPC in target region
       amazon.aws.ec2_vpc_net_info:
-        region: "{{ aws_target_region }}"
+        region: "{{ resolved_target_region }}"
         filters:
           is-default: "true"
       register: target_default_vpc
@@ -113,7 +194,7 @@
     - name: Fail when no VPC is available in target region
       ansible.builtin.fail:
         msg: |
-          No VPC available for region {{ aws_target_region }}.
+          No VPC available for region {{ resolved_target_region }}.
 
           Set extra var aws_target_vpc_id to a VPC in that region (for example vpc-0123456789abcdef0).
 
@@ -123,7 +204,7 @@
 
     - name: Look up subnets in target VPC
       amazon.aws.ec2_vpc_subnet_info:
-        region: "{{ aws_target_region }}"
+        region: "{{ resolved_target_region }}"
         filters:
           vpc-id: "{{ deploy_vpc_id }}"
       register: target_subnets
@@ -161,7 +242,7 @@
     - name: Fail when no subnet is available
       ansible.builtin.fail:
         msg: |
-          No subnet available in VPC {{ deploy_vpc_id }} (region {{ aws_target_region }}).
+          No subnet available in VPC {{ deploy_vpc_id }} (region {{ resolved_target_region }}).
 
           Set extra var aws_target_subnet_id to a subnet that can reach the internet
           (public subnet with map-public-ip-on-launch, or a private subnet with routing as required).
@@ -170,7 +251,7 @@
     - name: Ensure SSH key pair exists in target region
       amazon.aws.ec2_key:
         name: "{{ key_pair_name }}"
-        region: "{{ aws_target_region }}"
+        region: "{{ resolved_target_region }}"
         key_material: "{{ aws_instance_public_key }}"
         state: present
 
@@ -178,7 +259,7 @@
       amazon.aws.ec2_security_group:
         name: "{{ security_group_name }}"
         description: "Migration security group for {{ resource_prefix }}"
-        region: "{{ aws_target_region }}"
+        region: "{{ resolved_target_region }}"
         vpc_id: "{{ deploy_vpc_id }}"
         rules:
           - proto: tcp
@@ -205,7 +286,7 @@
     - name: Launch migrated EC2 instance from copied AMI
       amazon.aws.ec2_instance:
         name: "{{ instance_name_tag }}"
-        region: "{{ aws_target_region }}"
+        region: "{{ resolved_target_region }}"
         state: present
         image_id: "{{ deploy_ami_id }}"
         instance_type: "{{ aws_instance_size }}"
@@ -220,16 +301,16 @@
           Name: "{{ instance_name_tag }}"
           Provisioner: Ansible-Migration
           Manager: Ansible
-          SourceAMI: "{{ source_ami_id }}"
-          SourceRegion: "{{ aws_source_region }}"
+          SourceAMI: "{{ resolved_source_ami_id }}"
+          SourceRegion: "{{ resolved_source_region }}"
           MigratedAMI: "{{ deploy_ami_id }}"
       register: migrated_instance
 
     - name: Show migration result
       ansible.builtin.debug:
         msg:
-          - "Source AMI {{ source_ami_id }} ({{ aws_source_region }})"
-          - "Target AMI {{ deploy_ami_id }} ({{ aws_target_region }})"
+          - "Source AMI {{ resolved_source_ami_id }} ({{ resolved_source_region }})"
+          - "Target AMI {{ deploy_ami_id }} ({{ resolved_target_region }})"
           - "New instance id: {{ migrated_instance.instance_ids[0] | default('unknown') }}"
           - "New public IP: {{ migrated_instance.instances[0].public_ip_address | default(migrated_instance.instances[0].public_ip | default('pending')) }}"
           - "New public DNS: {{ migrated_instance.instances[0].public_dns_name | default('pending') }}"
@@ -245,5 +326,5 @@
           migrated_public_ip: "{{ migrated_instance.instances[0].public_ip_address | default(migrated_instance.instances[0].public_ip | default('')) }}"
           migrated_public_dns: "{{ migrated_instance.instances[0].public_dns_name | default('') }}"
           deploy_ami_id: "{{ deploy_ami_id }}"
-          aws_target_region: "{{ aws_target_region }}"
+          aws_target_region: "{{ resolved_target_region }}"
         per_host: false

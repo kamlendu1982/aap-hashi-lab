@@ -31,6 +31,8 @@
     - name: Publish AMI details for downstream workflow jobs
       ansible.builtin.set_stats:
         data:
-          source_ami_id: "{{ ami_result.image_id }}"
-          aws_source_region: "{{ aws_region }}"
+          migration_source_ami_id: "{{ ami_result.image_id | string | trim | regex_replace('[\r\n\t]+', '') }}"
+          migration_source_region: "{{ aws_region | string | trim | regex_replace('[\r\n\t]+', '') }}"
+          source_ami_id: "{{ ami_result.image_id | string | trim | regex_replace('[\r\n\t]+', '') }}"
+          aws_source_region: "{{ aws_region | string | trim | regex_replace('[\r\n\t]+', '') }}"
         per_host: false
