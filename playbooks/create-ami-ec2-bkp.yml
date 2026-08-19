@@ -27,3 +27,10 @@
     - name: Show the resulting AMI ID
       ansible.builtin.debug:
         msg: "Created AMI {{ ami_result.image_id }} from instance {{ instance_id }}. Save this AMI ID to restore later."
+
+    - name: Publish AMI details for downstream workflow jobs
+      ansible.builtin.set_stats:
+        data:
+          source_ami_id: "{{ ami_result.image_id }}"
+          aws_source_region: "{{ aws_region }}"
+        per_host: false

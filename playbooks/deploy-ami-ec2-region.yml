@@ -7,8 +7,8 @@
 #   3. Cut over to new public IP, then destroy old region stack
 #
 # Required extra vars / survey:
-#   source_ami_id         AMI from create-ami-ec2-bkp.yml (or existing AMI)
-#   aws_source_region     Region where source_ami_id exists
+#   source_ami_id         From create-ami job via workflow set_stats, or survey/extra var
+#   aws_source_region     Source region (workflow set_stats or aws_region extra var)
 #   aws_target_region     Region to deploy into (e.g. us-east-1)
 #   aws_name_tag          Name prefix (matches Terraform lab)
 #   aws_instance_public_key
@@ -30,6 +30,7 @@
   gather_facts: false
 
   vars:
+    aws_source_region: "{{ aws_source_region | default(aws_region) }}"
     migrated_instance_name: "{{ input_migrated_instance_name | default('instance-1') }}"
     resource_prefix: "{{ aws_name_tag }}"
     security_group_name: "{{ resource_prefix }}-sg"
@@ -94,17 +95,30 @@
         filters:
           is-default: "true"
       register: target_default_vpc
-      when: aws_target_vpc_id is not defined or aws_target_vpc_id | length == 0
+      when: aws_target_vpc_id is not defined or (aws_target_vpc_id | string | trim | length == 0)
 
-    - name: Select target VPC
+    - name: Use supplied target VPC id
       ansible.builtin.set_fact:
-        deploy_vpc_id: "{{ aws_target_vpc_id | default(target_default_vpc.vpcs[0].vpc_id) }}"
+        deploy_vpc_id: "{{ aws_target_vpc_id | string | trim }}"
+      when: aws_target_vpc_id is defined and (aws_target_vpc_id | string | trim | length > 0)
+
+    - name: Use default VPC in target region
+      ansible.builtin.set_fact:
+        deploy_vpc_id: "{{ target_default_vpc.vpcs[0].vpc_id }}"
+      when:
+        - deploy_vpc_id is not defined or deploy_vpc_id | length == 0
+        - target_default_vpc is not skipped
+        - target_default_vpc.vpcs | length > 0
 
     - name: Fail when no VPC is available in target region
       ansible.builtin.fail:
-        msg: >
-          No default VPC found in {{ aws_target_region }}.
-          Set aws_target_vpc_id to an existing VPC in that region.
+        msg: |
+          No VPC available for region {{ aws_target_region }}.
+
+          Set extra var aws_target_vpc_id to a VPC in that region (for example vpc-0123456789abcdef0).
+
+          Default VPC lookup found {{ target_default_vpc.vpcs | default([]) | length }} default VPC(s).
+          Many AWS accounts do not have a default VPC in every region.
       when: deploy_vpc_id is not defined or deploy_vpc_id | length == 0
 
     - name: Look up subnets in target VPC
@@ -113,33 +127,44 @@
         filters:
           vpc-id: "{{ deploy_vpc_id }}"
       register: target_subnets
-      when: aws_target_subnet_id is not defined or aws_target_subnet_id | length == 0
+      when: aws_target_subnet_id is not defined or (aws_target_subnet_id | string | trim | length == 0)
 
-    - name: Select target subnet
+    - name: Use supplied target subnet id
+      ansible.builtin.set_fact:
+        deploy_subnet_id: "{{ aws_target_subnet_id | string | trim }}"
+      when: aws_target_subnet_id is defined and (aws_target_subnet_id | string | trim | length > 0)
+
+    - name: Select first public subnet in target VPC
       ansible.builtin.set_fact:
         deploy_subnet_id: >-
           {{
-            aws_target_subnet_id | default(
-              (
-                target_subnets.subnets
-                | selectattr('map_public_ip_on_launch', 'equalto', true)
-                | map(attribute='subnet_id')
-                | list
-                | first
-              )
-              | default(
-                target_subnets.subnets | map(attribute='subnet_id') | list | first,
-                true
-              ),
-              true
-            )
+            target_subnets.subnets
+            | selectattr('map_public_ip_on_launch', 'equalto', true)
+            | map(attribute='subnet_id')
+            | list
+            | first
+            | default('')
           }}
+      when:
+        - deploy_subnet_id is not defined or deploy_subnet_id | length == 0
+        - target_subnets is not skipped
+        - target_subnets.subnets | length > 0
+
+    - name: Fall back to any subnet in target VPC
+      ansible.builtin.set_fact:
+        deploy_subnet_id: "{{ target_subnets.subnets | map(attribute='subnet_id') | list | first | default('') }}"
+      when:
+        - deploy_subnet_id is not defined or deploy_subnet_id | length == 0
+        - target_subnets is not skipped
+        - target_subnets.subnets | length > 0
 
     - name: Fail when no subnet is available
       ansible.builtin.fail:
-        msg: >
-          No subnet found in VPC {{ deploy_vpc_id }} (region {{ aws_target_region }}).
-          Set aws_target_subnet_id explicitly.
+        msg: |
+          No subnet available in VPC {{ deploy_vpc_id }} (region {{ aws_target_region }}).
+
+          Set extra var aws_target_subnet_id to a subnet that can reach the internet
+          (public subnet with map-public-ip-on-launch, or a private subnet with routing as required).
       when: deploy_subnet_id is not defined or deploy_subnet_id | length == 0
 
     - name: Ensure SSH key pair exists in target region
@@ -212,3 +237,13 @@
           - "Security group: {{ security_group_name }}  Key pair: {{ key_pair_name }}"
           - "Test: curl http://{{ migrated_instance.instances[0].public_ip_address | default(migrated_instance.instances[0].public_ip | default('<public-ip>')) }}/"
           - "After validation, destroy the old region stack only (keep aws_source_region in destroy job)."
+
+    - name: Publish migrated instance details for downstream workflow jobs
+      ansible.builtin.set_stats:
+        data:
+          migrated_instance_id: "{{ migrated_instance.instance_ids[0] }}"
+          migrated_public_ip: "{{ migrated_instance.instances[0].public_ip_address | default(migrated_instance.instances[0].public_ip | default('')) }}"
+          migrated_public_dns: "{{ migrated_instance.instances[0].public_dns_name | default('') }}"
+          deploy_ami_id: "{{ deploy_ami_id }}"
+          aws_target_region: "{{ aws_target_region }}"
+        per_host: false
